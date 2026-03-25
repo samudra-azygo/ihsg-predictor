@@ -135,3 +135,4 @@ Aksi : Trading normal · ambil Top 5 · posisi penuh
 - **Diam adalah posisi** — lampu merah = tidak trading, modal aman
 - **Model belajar sendiri** — bobot ditentukan data, bukan tebakan
 - **Retrain berkala** — model diperbarui setiap bulan atau saat drift
+# force Thu Mar 26 05:09:32 WIB 2026
