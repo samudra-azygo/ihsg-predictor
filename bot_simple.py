@@ -1,26 +1,17 @@
 import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from telegram.constants import ParseMode
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 
 async def start(update, ctx):
-    keyboard = [
-        [InlineKeyboardButton("Ranking", callback_data="ranking"),
-         InlineKeyboardButton("Lampu", callback_data="lampu")],
-        [InlineKeyboardButton("Status", callback_data="status")],
-    ]
-    await update.message.reply_text(
-        "Selamat datang di IHSG Predictor Bot! Ketik /help",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    await update.message.reply_text("Selamat datang di IHSG Bot! Ketik /help")
 
 async def lampu(update, ctx):
     await update.message.reply_text("LAMPU: HIJAU - Kondisi pasar normal.")
 
 async def status(update, ctx):
-    await update.message.reply_text("Status: Online - Bot berjalan di Railway 24 jam!")
+    await update.message.reply_text("Status: Online - Bot berjalan 24 jam!")
 
 async def ranking(update, ctx):
     await update.message.reply_text("Ranking: Model belum ditraining.")
