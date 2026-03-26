@@ -1,4 +1,4 @@
-import os
+code = """import os
 import requests
 from xml.etree import ElementTree as ET
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler
@@ -290,3 +290,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+"""
+
+with open("bot_simple.py", "w") as f:
+    f.write(code)
+print("bot_simple.py berhasil dibuat")
