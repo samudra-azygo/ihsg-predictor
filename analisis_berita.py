@@ -15,18 +15,26 @@ os.makedirs("data/berita", exist_ok=True)
 
 # ── Kamus sentimen ────────────────────────────────────────────
 POSITIF = [
-    "naik","tumbuh","meningkat","rekor","tertinggi","laba","untung",
-    "dividen","akuisisi","kontrak","ekspansi","investasi","rally",
-    "bullish","upgrade","buy","profit","surplus","optimis","pulih",
-    "top gainer","menguat","apresiasi","solid","positif","bertumbuh",
-    "capex","right issue","buyback","stock split","bonus saham",
+    "naik","tumbuh","meningkat","rekor","laba","untung","dividen",
+    "kontrak","ekspansi","investasi","rally","bullish","profit",
+    "surplus","optimis","pulih","menguat","solid","positif",
+    "minyak naik","crude naik","coal naik","emas naik","gold naik",
+    "harga minyak","harga emas","harga batu bara","harga coal",
+    "energy rally","komoditas naik","windfall","supercycle",
+    "akuisisi","right issue","buyback","stock split","dividen naik",
+    "laba naik","pendapatan naik","pertumbuhan","ekspor naik",
 ]
 NEGATIF = [
-    "turun","merosot","anjlok","rugi","kerugian","bangkrut","pailit",
+    "turun","merosot","anjlok","rugi","kerugian","bangkrut",
     "suspensi","delisting","gagal","default","korupsi","kasus",
-    "bearish","downgrade","sell","tekanan","krisis","inflasi",
-    "resesi","perang","bencana","banjir","kebakaran","longsor",
-    "penyelidikan","tersangka","penyidikan","pembekuan","sanksi",
+    "bearish","tekanan","krisis","resesi","perang","bencana",
+    "tersangka","penyidikan","sanksi","pembekuan",
+    "perang","serangan","rudal","bom","militer","konflik",
+    "Iran","Israel","Hormuz","blokade","eskalasi","invasi",
+    "geopolitik","ketegangan","ancaman","embargo",
+    "inflasi tinggi","stagflasi","resesi global","PHK massal",
+    "bangkrut","pailit","gagal bayar","kredit macet",
+    "banjir","gempa","tsunami","kebakaran hutan","kekeringan",
 ]
 
 # ── Daftar saham IDX ──────────────────────────────────────────

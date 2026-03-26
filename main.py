@@ -15,13 +15,28 @@ TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ── Kamus sentimen ────────────────────────────────────────────
-POSITIF = ["naik","tumbuh","meningkat","rekor","laba","untung","dividen",
-           "kontrak","ekspansi","investasi","rally","bullish","profit",
-           "surplus","optimis","pulih","menguat","solid","positif"]
-NEGATIF = ["turun","merosot","anjlok","rugi","kerugian","bangkrut",
-           "suspensi","delisting","gagal","default","korupsi","kasus",
-           "bearish","tekanan","krisis","resesi","perang","bencana",
-           "tersangka","penyidikan","sanksi"]
+POSITIF = [
+    "naik","tumbuh","meningkat","rekor","laba","untung","dividen",
+    "kontrak","ekspansi","investasi","rally","bullish","profit",
+    "surplus","optimis","pulih","menguat","solid","positif",
+    "minyak naik","crude naik","coal naik","emas naik","gold naik",
+    "harga minyak","harga emas","harga batu bara","harga coal",
+    "energy rally","komoditas naik","windfall","supercycle",
+    "akuisisi","right issue","buyback","stock split","dividen naik",
+    "laba naik","pendapatan naik","pertumbuhan","ekspor naik",
+]
+NEGATIF = [
+    "turun","merosot","anjlok","rugi","kerugian","bangkrut",
+    "suspensi","delisting","gagal","default","korupsi","kasus",
+    "bearish","tekanan","krisis","resesi","perang","bencana",
+    "tersangka","penyidikan","sanksi","pembekuan",
+    "perang","serangan","rudal","bom","militer","konflik",
+    "Iran","Israel","Hormuz","blokade","eskalasi","invasi",
+    "geopolitik","ketegangan","ancaman","embargo",
+    "inflasi tinggi","stagflasi","resesi global","PHK massal",
+    "bangkrut","pailit","gagal bayar","kredit macet",
+    "banjir","gempa","tsunami","kebakaran hutan","kekeringan",
+]
 
 SAHAM_LIST = [
     "BBCA","BBRI","BMRI","BBNI","BRIS","BNGA","BBTN","PNBN",
