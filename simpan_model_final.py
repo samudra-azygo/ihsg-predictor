@@ -25,12 +25,14 @@ df_cuaca.index = pd.to_datetime(df_cuaca.index)
 
 df_makro  = pd.read_csv("data/makro/MAKRO_GABUNGAN.csv", index_col=0)
 df_makro.index = pd.to_datetime(df_makro.index)
+df_enso   = pd.read_csv("data/enso/ENSO_KALENDER_GABUNGAN.csv", index_col=0)
+df_enso.index = pd.to_datetime(df_enso.index)
 
 print(f"  Komoditas: {len(df_kom.columns)} fitur")
 print(f"  Cuaca    : {len(df_cuaca.columns)} fitur")
 print(f"  Makro    : {len(df_makro.columns)} fitur")
 
-df_eksterior = df_kom.join(df_cuaca, how="outer").join(df_makro, how="outer")
+df_eksterior = df_kom.join(df_cuaca, how="outer").join(df_makro, how="outer").join(df_enso, how="outer")
 print(f"  TOTAL    : {len(df_eksterior.columns)} fitur eksterior")
 
 # ── Setup sektor ──────────────────────────────────────────────
