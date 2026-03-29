@@ -3,6 +3,7 @@ main.py
 Jalankan bot Telegram + jadwal otomatis sekaligus
 - Bot Telegram aktif 24 jam (balas perintah)
 - Jadwal otomatis: 08:00 download, 08:15 scoring, 08:30 kirim ranking, 15:30 evaluasi
+- Sentimen: Groq AI (llama-3.1-8b-instant) — fallback ke kamus kata kunci
 """
 import os, time, pickle, requests, schedule, threading
 import pandas as pd, numpy as np
@@ -11,10 +12,17 @@ from xml.etree import ElementTree as ET
 from telegram import Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TOKEN        = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID      = os.environ.get("TELEGRAM_CHAT_ID", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-# ── Kamus sentimen ────────────────────────────────────────────
+# ── Cache sentimen AI (supaya Groq tidak dipanggil berkali-kali) ──
+_cache_sentimen_ai = {
+    "tanggal" : None,
+    "hasil"   : None,   # dict: {skor_global, sentimen, lampu, bobot, skor_saham}
+}
+
+# ── Kamus sentimen (FALLBACK kalau Groq gagal) ────────────────
 POSITIF = [
     "laba naik","laba tumbuh","laba meningkat","laba bersih naik",
     "pendapatan naik","revenue naik","omzet naik",
@@ -29,7 +37,7 @@ POSITIF = [
     "inflasi turun","deflasi","suku bunga turun","fed cut",
     "rupiah menguat","rupiah apresiasi",
     "ekspor naik","neraca dagang surplus",
-    "IPO","listing baru","right issue",
+    "IPO","listing baru",
 ]
 NEGATIF = [
     "rugi","kerugian","laba turun","laba merosot","laba anjlok",
@@ -90,22 +98,58 @@ def kirim_telegram(pesan):
         print(f"[MSG] {pesan[:80]}")
         return
     try:
-        url  = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": pesan}, timeout=10)
     except Exception as e:
         print(f"ERROR kirim: {e}")
 
-def ambil_sentimen():
+# ── Sentimen AI (Groq) ────────────────────────────────────────
+def ambil_sentimen_groq():
+    """
+    Panggil Groq AI via sentimen_ai.py.
+    Return dict: {skor_global, sentimen, lampu, bobot, skor_saham}
+    atau None kalau gagal.
+    Hasil di-cache per hari supaya tidak panggil Groq berkali-kali.
+    """
+    global _cache_sentimen_ai
+    tanggal = datetime.now().strftime("%Y-%m-%d")
+
+    # Pakai cache kalau hari sama
+    if _cache_sentimen_ai["tanggal"] == tanggal and _cache_sentimen_ai["hasil"]:
+        print("  [Sentimen] Pakai cache hari ini")
+        return _cache_sentimen_ai["hasil"]
+
+    if not GROQ_API_KEY:
+        print("  [Sentimen] GROQ_API_KEY tidak ada → pakai kamus kata kunci")
+        return None
+
+    try:
+        from sentimen_ai import scoring_sentimen_ai
+        print("  [Sentimen] Memanggil Groq AI...")
+        hasil = scoring_sentimen_ai(api_key=GROQ_API_KEY)
+        if hasil:
+            _cache_sentimen_ai["tanggal"] = tanggal
+            _cache_sentimen_ai["hasil"]   = hasil
+            print(f"  [Sentimen AI] Skor: {hasil['skor_global']:+.2f} | {hasil['lampu']}")
+            return hasil
+    except Exception as e:
+        print(f"  [Sentimen] Groq gagal: {e}")
+
+    return None
+
+# ── Sentimen fallback (kamus kata kunci lama) ─────────────────
+def ambil_sentimen_kamus():
+    """Kamus kata kunci — dipakai kalau Groq tidak tersedia."""
     sumber = {
         "IDX"  : "https://www.idxchannel.com/rss",
         "CNBC" : "https://www.cnbcindonesia.com/rss",
         "Detik": "https://finance.detik.com/rss",
     }
-    skor_saham = {}
+    skor_saham  = {}
     skor_sektor = {}
     skor_global = 0
-    berita_pos = []
-    berita_neg = []
+    berita_pos  = []
+    berita_neg  = []
 
     for nama, url in sumber.items():
         try:
@@ -132,6 +176,42 @@ def ambil_sentimen():
             pass
 
     return skor_saham, skor_sektor, skor_global, berita_pos[:3], berita_neg[:3]
+
+def ambil_sentimen():
+    """
+    Wrapper utama:
+    1. Coba Groq AI dulu
+    2. Kalau gagal → fallback kamus kata kunci
+    Return selalu 5-tuple agar kompatibel dengan semua pemanggil lama:
+      (skor_saham, skor_sektor, skor_global_display, berita_pos, berita_neg)
+    """
+    ai = ambil_sentimen_groq()
+    if ai:
+        skor_saham  = ai.get("skor_saham", {})
+        skor_sektor = {}   # Groq belum per-sektor, teknikal tetap jalan normal
+        skor_global = ai["skor_global"]   # float -2 s/d +2
+
+        # Baca berita pos/neg dari CSV hasil Groq hari ini
+        tanggal  = datetime.now().strftime("%Y-%m-%d")
+        csv_path = f"data/berita/sentimen_ai_{tanggal}.csv"
+        berita_pos, berita_neg = [], []
+        if os.path.exists(csv_path):
+            try:
+                df_b = pd.read_csv(csv_path)
+                pos  = df_b[df_b["skor"] >= 1].sort_values("skor", ascending=False)
+                neg  = df_b[df_b["skor"] <= -1].sort_values("skor")
+                berita_pos = [f"+{r['skor']} [{r['sumber']}] {r['judul'][:50]}"
+                              for _, r in pos.head(3).iterrows()]
+                berita_neg = [f"{r['skor']} [{r['sumber']}] {r['judul'][:50]}"
+                              for _, r in neg.head(3).iterrows()]
+            except:
+                pass
+
+        return skor_saham, skor_sektor, skor_global, berita_pos, berita_neg
+
+    # Fallback kamus kata kunci
+    print("  [Sentimen] Pakai kamus kata kunci (fallback)")
+    return ambil_sentimen_kamus()
 
 def hitung_skor_teknikal(df):
     close  = df["close"]
@@ -162,15 +242,21 @@ def scoring_harian():
 
     skor_saham, skor_sektor, skor_global, bpos, bneg = ambil_sentimen()
 
-    if skor_global > 5:
-        lampu = "HIJAU"
-        bobot = 1.1
-    elif skor_global < -5:
-        lampu = "MERAH"
-        bobot = 0.9
+    # Deteksi apakah pakai Groq AI atau kamus (untuk threshold yang tepat)
+    pakai_ai = _cache_sentimen_ai["tanggal"] == tanggal and _cache_sentimen_ai["hasil"] is not None
+
+    if pakai_ai:
+        # Skala Groq: -2 s/d +2
+        lampu = "HIJAU"  if skor_global >  0.3 else "MERAH"  if skor_global < -0.3 else "KUNING"
+        bobot = _cache_sentimen_ai["hasil"]["bobot"]
+        mode_sentimen = f"AI Groq ({skor_global:+.2f})"
     else:
-        lampu = "KUNING"
-        bobot = 1.0
+        # Skala kamus: bisa puluhan
+        lampu = "HIJAU"  if skor_global >  5 else "MERAH"  if skor_global < -5 else "KUNING"
+        bobot = 1.1 if skor_global > 5 else 0.9 if skor_global < -5 else 1.0
+        mode_sentimen = f"Kamus ({skor_global:+d})"
+
+    print(f"  Sentimen: {mode_sentimen} | Lampu: {lampu}")
 
     try:
         with open("models/models_latest.pkl","rb") as f:
@@ -198,8 +284,16 @@ def scoring_harian():
 
             skor_tek = hitung_skor_teknikal(df)
             sektor   = SEKTOR_SAHAM.get(kode, "lainnya")
-            skor_b   = skor_saham.get(kode, 0) * 3 + skor_sektor.get(sektor, 0)
-            skor_b_n = max(30, min(70, 50 + skor_b * 5))
+
+            # Skor berita per saham
+            if pakai_ai:
+                # Groq: skor_saham sudah per-ticker (akumulasi skor -2 s/d +2)
+                skor_b_raw = skor_saham.get(kode, 0)
+                skor_b_n   = max(30, min(70, 50 + skor_b_raw * 10))
+            else:
+                # Kamus: skala bisa lebih besar
+                skor_b   = skor_saham.get(kode, 0) * 3 + skor_sektor.get(sektor, 0)
+                skor_b_n = max(30, min(70, 50 + skor_b * 5))
 
             model_s = models.get(sektor, models.get("lainnya"))
             proba   = 0.5
@@ -216,9 +310,12 @@ def scoring_harian():
 
             sinyal = "BELI" if skor_f >= 75 else "PANTAU" if skor_f >= 55 else "SKIP"
             hasil.append({
-                "ticker": kode, "sektor": sektor,
-                "skor": skor_f, "skor_tek": skor_tek,
-                "proba": round(proba, 3), "sinyal": sinyal,
+                "ticker"  : kode,
+                "sektor"  : sektor,
+                "skor"    : skor_f,
+                "skor_tek": skor_tek,
+                "proba"   : round(proba, 3),
+                "sinyal"  : sinyal,
             })
         except:
             pass
@@ -232,9 +329,10 @@ def scoring_harian():
     beli   = df_hasil[df_hasil["sinyal"]=="BELI"]
     pantau = df_hasil[df_hasil["sinyal"]=="PANTAU"]
 
+    label_skor = f"{skor_global:+.2f}" if pakai_ai else f"{skor_global:+d}"
     baris = [
         f"IHSG Predictor — {tanggal}",
-        f"Lampu: {lampu} | Berita: {skor_global:+d}",
+        f"Lampu: {lampu} | {'AI Groq' if pakai_ai else 'Kamus'}: {label_skor}",
         "",
         "TOP 10 SAHAM:",
     ]
@@ -258,7 +356,7 @@ def scoring_harian():
         for b in bneg:
             baris.append(f"  {b}")
 
-    baris.append("\nAkurasi: 60.45% | Fitur: 145")
+    baris.append(f"\nAkurasi: 60.45% | Sentimen: {'AI Groq' if pakai_ai else 'Kamus'}")
     kirim_telegram(chr(10).join(baris))
     print(f"  Ranking terkirim | Lampu: {lampu} | BELI: {len(beli)}")
     return df_hasil
@@ -274,7 +372,7 @@ def download_data():
             ts = r.json()["chart"]["result"][0]
             q  = ts["indicators"]["quote"][0]
             df_baru = pd.DataFrame({
-                "date"  : pd.to_datetime(ts["timestamp"],unit="s").strftime("%Y-%m-%d"),
+                "date"  : pd.to_datetime(ts["timestamp"], unit="s").strftime("%Y-%m-%d"),
                 "open"  : q["open"], "high": q["high"],
                 "low"   : q["low"],  "close": q["close"],
                 "volume": q["volume"],
@@ -337,8 +435,9 @@ async def ranking(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Menghitung ranking...")
     try:
         _, _, skor_global, bpos, bneg = ambil_sentimen()
-        tanggal = datetime.now().strftime("%Y-%m-%d")
-        path    = f"logs/ranking_{tanggal}.csv"
+        tanggal  = datetime.now().strftime("%Y-%m-%d")
+        path     = f"logs/ranking_{tanggal}.csv"
+        pakai_ai = _cache_sentimen_ai["tanggal"] == tanggal and _cache_sentimen_ai["hasil"] is not None
 
         if os.path.exists(path):
             df = pd.read_csv(path).sort_values("skor", ascending=False)
@@ -348,11 +447,17 @@ async def ranking(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Belum ada data ranking hari ini")
                 return
 
-        top10  = df.head(10)
-        lampu  = "HIJAU" if skor_global > 5 else "MERAH" if skor_global < -5 else "KUNING"
-        baris  = [
+        top10 = df.head(10)
+        if pakai_ai:
+            lampu = "HIJAU" if skor_global > 0.3 else "MERAH" if skor_global < -0.3 else "KUNING"
+            label = f"AI Groq: {skor_global:+.2f}"
+        else:
+            lampu = "HIJAU" if skor_global > 5 else "MERAH" if skor_global < -5 else "KUNING"
+            label = f"Kamus: {skor_global:+d}"
+
+        baris = [
             f"TOP 10 SAHAM ({tanggal}):",
-            f"Lampu: {lampu} | Berita: {skor_global:+d}",
+            f"Lampu: {lampu} | {label}",
             "",
         ]
         for i, (_, r) in enumerate(top10.iterrows(), 1):
@@ -373,17 +478,27 @@ async def ranking(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {e}")
 
 async def berita(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Mengambil berita...")
+    await update.message.reply_text("Mengambil berita (AI Groq)..." if GROQ_API_KEY else "Mengambil berita...")
     try:
         _, _, skor_global, bpos, bneg = ambil_sentimen()
-        label  = "POSITIF" if skor_global > 3 else "NEGATIF" if skor_global < -3 else "NETRAL"
-        baris  = [f"BERITA PASAR: {label} ({skor_global:+d})", ""]
+        pakai_ai = _cache_sentimen_ai["tanggal"] == datetime.now().strftime("%Y-%m-%d") \
+                   and _cache_sentimen_ai["hasil"] is not None
+        if pakai_ai:
+            label  = "POSITIF" if skor_global > 0.3 else "NEGATIF" if skor_global < -0.3 else "NETRAL"
+            header = f"BERITA PASAR (AI Groq): {label} ({skor_global:+.2f})"
+        else:
+            label  = "POSITIF" if skor_global > 3 else "NEGATIF" if skor_global < -3 else "NETRAL"
+            header = f"BERITA PASAR (Kamus): {label} ({skor_global:+d})"
+
+        baris = [header, ""]
         if bpos:
             baris.append("POSITIF:")
             baris.extend(bpos)
         if bneg:
             baris.append("\nNEGATIF:")
             baris.extend(bneg)
+        if not bpos and not bneg:
+            baris.append("Tidak ada berita signifikan hari ini")
         await update.message.reply_text(chr(10).join(baris))
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
@@ -391,21 +506,31 @@ async def berita(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def lampu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         _, _, skor_global, _, _ = ambil_sentimen()
+        pakai_ai = _cache_sentimen_ai["tanggal"] == datetime.now().strftime("%Y-%m-%d") \
+                   and _cache_sentimen_ai["hasil"] is not None
+        if pakai_ai:
+            status = "HIJAU" if skor_global > 0.3 else "MERAH" if skor_global < -0.3 else "KUNING"
+            label  = f"Skor AI Groq: {skor_global:+.2f} (skala -2 s/d +2)"
+        else:
+            status = "HIJAU" if skor_global > 5 else "MERAH" if skor_global < -5 else "KUNING"
+            label  = f"Skor kamus: {skor_global:+d}"
     except:
-        skor_global = 0
-    status = "HIJAU" if skor_global > 5 else "MERAH" if skor_global < -5 else "KUNING"
-    baris  = [
+        status = "KUNING"
+        label  = "Skor: N/A"
+
+    baris = [
         f"LAMPU: {status}",
-        f"Skor berita: {skor_global:+d}",
+        label,
         "Akurasi model: 60.45%",
         "",
-        "HIJAU  = berita positif, trading normal",
+        "HIJAU  = sentimen positif, trading normal",
         "KUNING = sentimen campur, waspada",
-        "MERAH  = berita negatif, hati-hati",
+        "MERAH  = sentimen negatif, hati-hati",
     ]
     await update.message.reply_text(chr(10).join(baris))
 
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    mode = "AI Groq (llama-3.1-8b-instant)" if GROQ_API_KEY else "Kamus kata kunci (fallback)"
     baris = [
         "Status Sistem IHSG Predictor:",
         "",
@@ -415,10 +540,11 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Model    : 11 sektor RandomForest",
         "Saham    : 70 saham aktif",
         "Akurasi  : 60.45%",
-        "Fitur    : 145 total",
+        "Fitur    : 180 total",
+        f"Sentimen : {mode}",
         "",
         "Data: teknikal + komoditas + cuaca",
-        "      makro global + berita real-time",
+        "      makro global + ENSO + berita real-time",
     ]
     await update.message.reply_text(chr(10).join(baris))
 
@@ -442,16 +568,17 @@ async def risiko(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def posisi_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
     if not args or len(args) < 2:
-        await update.message.reply_text("Format: /posisi [modal_juta] [skor]" + chr(10) + "Contoh: /posisi 100 75")
+        await update.message.reply_text(
+            "Format: /posisi [modal_juta] [skor]\nContoh: /posisi 100 75")
         return
     try:
-        modal = float(args[0]) * 1_000_000
-        skor  = float(args[1])
+        modal  = float(args[0]) * 1_000_000
+        skor   = float(args[1])
         faktor = 1.0 if skor >= 80 else 0.75 if skor >= 70 else 0.5 if skor >= 55 else 0.0
         sinyal = "SKIP" if skor < 55 else "PANTAU - 50%" if skor < 70 else "BELI - penuh"
         alokasi = (modal * 0.8 / 5) * faktor
         baris = [
-            f"Kalkulasi Posisi:",
+            "Kalkulasi Posisi:",
             f"Modal    : Rp {modal/1e6:.0f} juta",
             f"Skor     : {skor}",
             f"Sinyal   : {sinyal}",
@@ -466,7 +593,7 @@ async def posisi_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def data_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     baris = [
-        "SUMBER DATA AKTIF (145 fitur):",
+        "SUMBER DATA AKTIF (180 fitur):",
         "",
         "1. HARGA: 70 saham IDX",
         "2. KOMODITAS: coal oil gold CPO",
@@ -478,8 +605,12 @@ async def data_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "   S&P500 NASDAQ Nikkei HangSeng",
         "   VIX | USD EUR CNY JPY SGD AUD/IDR",
         "   US Bond yield",
-        "5. BERITA real-time:",
+        "5. ENSO + Kalender:",
+        "   ONI/SOI El Nino | Libur nasional",
+        "   Ramadan Lebaran window dressing",
+        "6. BERITA real-time (AI Groq):",
         "   IDX Channel CNBC Detik Finance",
+        "   60+ berita dianalisis tiap pagi",
     ]
     await update.message.reply_text(chr(10).join(baris))
 
@@ -495,6 +626,7 @@ async def tombol(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     print("IHSG Predictor Bot + Jadwal Otomatis")
     print("="*40)
+    print(f"Sentimen: {'AI Groq aktif' if GROQ_API_KEY else 'Kamus kata kunci (GROQ_API_KEY tidak ada)'}")
 
     # Jalankan jadwal di thread terpisah
     thread = threading.Thread(target=jalankan_jadwal, daemon=True)
