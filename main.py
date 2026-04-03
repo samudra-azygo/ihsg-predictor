@@ -594,7 +594,13 @@ def jalankan_jadwal():
     schedule.every().day.at("01:15").do(scoring_harian)
     schedule.every().day.at("08:30").do(evaluasi)
     print("Jadwal aktif: 08:00 WIB download | 08:15 WIB scoring | 15:30 WIB evaluasi")
-    while True:
+    
+# ── Auto retrain mingguan ──────────────────────────────────────
+if AUTO_RETRAIN_OK:
+    schedule.every().sunday.at("19:00").do(jalankan_retrain)
+    print("[JADWAL] Auto retrain: setiap Minggu 02:00 WIB")
+
+while True:
         schedule.run_pending()
         time.sleep(30)
 
