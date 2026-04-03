@@ -1,22 +1,11 @@
 """
-brain.py — IHSG Predictor Brain
-Sistem AI yang belajar sendiri setiap hari.
-
-Jadwal otomatis di Railway:
-08:00 WIB - Download data saham terbaru
-08:15 WIB - Scoring + kirim sinyal ke Telegram
-21:00 WIB - Evaluasi prediksi kemarin (akurasi real)
-22:00 WIB - Auto learning: coba strategi baru
-23:00 WIB - Update model jika lebih baik
-23:30 WIB - Laporan harian ke Telegram
-
-Loop belajar:
-1. Setiap hari: evaluasi prediksi vs kenyataan
-2. Setiap hari: coba 1 strategi baru (rotasi)
-3. Setiap minggu: analisis fitur mana paling berguna
-4. Setiap bulan: retrain dari nol dengan semua insight
+brain.py — IHSG Predictor Brain v2
+Jadwal:
+- 07:00 WIB: mulai training loop sampai akurasi naik
+- 22:00 WIB: kirim laporan ke Telegram
+- Loop training berhenti kalau: akurasi sudah naik ATAU sudah jam 21:45 WIB
 """
-import os, time, ssl, json, pickle, warnings, math
+import os, time, ssl, json, pickle, warnings
 import urllib.request, urllib.error, urllib.parse
 import pandas as pd
 import numpy as np
@@ -25,70 +14,30 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
-from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.metrics import accuracy_score
 warnings.filterwarnings("ignore")
 
-# ── Setup ─────────────────────────────────────────────────────
 os.makedirs("models", exist_ok=True)
 os.makedirs("logs/brain", exist_ok=True)
-os.makedirs("data", exist_ok=True)
 
 CTX = ssl.create_default_context()
 CTX.check_hostname = False
 CTX.verify_mode    = ssl.CERT_NONE
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; IHSGBrain/1.0)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; IHSGBrain/2.0)"}
 TOKEN   = os.environ.get("TELEGRAM_TOKEN","")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID","")
 
-# ── File state otak ───────────────────────────────────────────
-BRAIN_STATE = "logs/brain/state.json"
-BEST_ACC    = "logs/brain/best_accuracy.txt"
-HISTORY     = "logs/brain/history.csv"
-PRED_LOG    = "logs/brain/predictions.csv"
+BEST_ACC_FILE = "logs/brain/best_accuracy.txt"
+HISTORY_FILE  = "logs/brain/history.csv"
+STATE_FILE    = "logs/brain/state.json"
 
-def load_state():
-    default = {
-        "hari_ke": 0,
-        "akurasi_terbaik": 0.6045,
-        "strategi_index": 0,
-        "total_training": 0,
-        "total_deploy": 0,
-        "akurasi_7hari": [],
-        "fitur_terbaik": [],
-        "catatan": []
-    }
-    if os.path.exists(BRAIN_STATE):
-        try:
-            with open(BRAIN_STATE) as f:
-                state = json.load(f)
-                for k, v in default.items():
-                    if k not in state:
-                        state[k] = v
-                return state
-        except:
-            pass
-    return default
-
-def save_state(state):
-    with open(BRAIN_STATE,"w") as f:
-        json.dump(state, f, indent=2)
-
-def load_best_acc():
-    if os.path.exists(BEST_ACC):
-        try:
-            return float(open(BEST_ACC).read().strip())
-        except:
-            pass
-    return 0.6045
-
-def save_best_acc(acc):
-    with open(BEST_ACC,"w") as f:
-        f.write(str(acc))
+TARGET_ACC    = 0.66   # target akhir
+BASELINE_ACC  = 0.6045 # akurasi model lama
 
 # ── Telegram ──────────────────────────────────────────────────
 def telegram(pesan):
     if not TOKEN or not CHAT_ID:
-        print(f"[TELEGRAM]\n{pesan[:200]}")
+        print(f"[TELEGRAM]\n{pesan[:300]}")
         return
     try:
         url  = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -99,11 +48,43 @@ def telegram(pesan):
         }).encode()
         req = urllib.request.Request(url, data=data)
         urllib.request.urlopen(req, timeout=15, context=CTX)
+        print("Telegram terkirim")
     except Exception as e:
         print(f"Telegram error: {e}")
 
-# ── Download Yahoo Finance ────────────────────────────────────
-def yahoo(ticker, period="5y", full=False):
+# ── State ─────────────────────────────────────────────────────
+def load_best_acc():
+    if os.path.exists(BEST_ACC_FILE):
+        try: return float(open(BEST_ACC_FILE).read().strip())
+        except: pass
+    return BASELINE_ACC
+
+def save_best_acc(acc):
+    with open(BEST_ACC_FILE,"w") as f: f.write(str(acc))
+
+def load_state():
+    default = {"hari_ke":0,"total_training":0,"total_deploy":0,
+               "riwayat_cv":[],"strategi_index":0}
+    if os.path.exists(STATE_FILE):
+        try:
+            s = json.load(open(STATE_FILE))
+            for k,v in default.items():
+                if k not in s: s[k] = v
+            return s
+        except: pass
+    return default
+
+def save_state(state):
+    with open(STATE_FILE,"w") as f: json.dump(state, f, indent=2)
+
+def simpan_history(row):
+    df = pd.read_csv(HISTORY_FILE) if os.path.exists(HISTORY_FILE) \
+         else pd.DataFrame()
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    df.to_csv(HISTORY_FILE, index=False)
+
+# ── Download ──────────────────────────────────────────────────
+def yahoo(ticker, period="5y"):
     url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
            f"?range={period}&interval=1d&includePrePost=false")
     for attempt in range(3):
@@ -113,20 +94,11 @@ def yahoo(ticker, period="5y", full=False):
                 d = json.loads(r.read().decode())
             res = d["chart"]["result"]
             if not res: return None
-            ts = res[0]["timestamp"]
-            q  = res[0]["indicators"]["quote"][0]
-            dates = pd.to_datetime(ts, unit="s").normalize()
-            if full:
-                df = pd.DataFrame({
-                    "close" : q.get("close",[]),
-                    "high"  : q.get("high",[]),
-                    "low"   : q.get("low",[]),
-                    "volume": q.get("volume",[]),
-                }, index=dates).dropna(subset=["close"])
-                return df if len(df)>50 else None
-            else:
-                s = pd.Series(q.get("close",[]), index=dates).dropna()
-                return s if len(s)>50 else None
+            ts     = res[0]["timestamp"]
+            closes = res[0]["indicators"]["quote"][0]["close"]
+            dates  = pd.to_datetime(ts, unit="s").normalize()
+            s = pd.Series(closes, index=dates).dropna()
+            return s if len(s) > 50 else None
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 time.sleep(8+attempt*5); continue
@@ -134,27 +106,23 @@ def yahoo(ticker, period="5y", full=False):
         except: return None
     return None
 
-# ── Download data saham terbaru ───────────────────────────────
-SAHAM_LIST = [
-    "BBCA","BBRI","BMRI","BBNI","BRIS","BNGA","BBTN","PNBN","BDMN","MEGA",
-    "BJBR","NISP","ARTO","BTPS","AGRO","TLKM","EXCL","ISAT","TOWR","MTEL",
-    "TBIG","LINK","ADRO","PTBA","ITMG","INCO","ANTM","TINS","MEDC","HRUM",
-    "MDKA","PTRO","DOID","MBAP","GEMS","BUMI","BYAN","MYOH","INDY","DEWA",
-    "ELSA","ESSA","PGAS","AKRA","ENRG","RUIS",
-    "UNVR","ICBP","MYOR","CPIN","GGRM","HMSP","INDF","ULTJ","DLTA","MLBI",
-    "KLBF","SIDO","ROTI","GOOD","ADES",
-    "AALI","SIMP","LSIP","SSMS","SGRO","BWPT",
-    "BSDE","CTRA","PWON","LPKR","SMRA","ASRI","MKPI","BEST","WSBP","TOTL",
-    "SMGR","INTP","WIKA","PTPP","WSKT","ADHI","NRCA","KRAS","IDPR",
-    "MIKA","SILO","HEAL","TSPC","KAEF","PRDA",
-    "SCMA","MNCN","EMTK","BMTR",
-    "GOTO","BUKA","MTDL",
-    "ACES","MAPI","LPPF","RALS","AMRT","CSAP",
-    "ASII","AUTO","SMSM","UNTR","INDS","GJTL",
-    "ADMF","BFIN","SMMA","TRIM","VINS","ASRM",
-    "JSMR","CMNP","META","GIAA","TMAS",
-]
+def download_asia():
+    tickers = {
+        "^SET.BK":"set","^HSI":"hangseng","^KLSE":"klci",
+        "^KS11":"kospi","^STI":"sti","000001.SS":"sse",
+        "^N225":"nikkei","^FTSE":"ftse","^GDAXI":"dax",
+        "USDIDR=X":"usdidr","JPYIDR=X":"jpyidr",
+        "^VVIX":"vvix","^DJI":"dowjones","BZ=F":"brent",
+    }
+    data = {}
+    for ticker, nama in tickers.items():
+        s = yahoo(ticker)
+        if s is not None: data[nama] = s
+        time.sleep(0.5)
+    print(f"  Asia: {len(data)}/14 sumber")
+    return data
 
+# ── Sektor ────────────────────────────────────────────────────
 SEKTOR = {
     "BBCA":"perbankan","BBRI":"perbankan","BMRI":"perbankan","BBNI":"perbankan",
     "BRIS":"perbankan","BNGA":"perbankan","BBTN":"perbankan","PNBN":"perbankan",
@@ -195,32 +163,11 @@ SEKTOR = {
     "GIAA":"infrastruktur","TMAS":"infrastruktur",
 }
 
-def update_data_saham():
-    """Download data saham terbaru dan update file CSV."""
-    ok = 0
-    for kode in SAHAM_LIST:
-        path = f"data/{kode}.csv"
-        df_baru = yahoo(f"{kode}.JK", period="3mo", full=True)
-        if df_baru is not None:
-            df_baru = df_baru.reset_index()
-            df_baru.columns = ["date","close","high","low","volume"]
-            df_baru["date"] = df_baru["date"].dt.strftime("%Y-%m-%d")
-            if os.path.exists(path):
-                df_lama = pd.read_csv(path)
-                df_g = pd.concat([df_lama,df_baru]).drop_duplicates(
-                    "date").sort_values("date")
-                df_g.to_csv(path, index=False)
-            else:
-                df_baru.to_csv(path, index=False)
-            ok += 1
-        time.sleep(0.3)
-    return ok
-
 # ── Fitur ─────────────────────────────────────────────────────
-def buat_fitur(df, data_asia, fitur_aktif=None):
+def buat_fitur(df, data_asia):
     close  = pd.to_numeric(df["close"], errors="coerce")
-    high   = pd.to_numeric(df.get("high",close), errors="coerce")
-    low    = pd.to_numeric(df.get("low",close), errors="coerce")
+    high   = pd.to_numeric(df.get("high", close), errors="coerce")
+    low    = pd.to_numeric(df.get("low", close), errors="coerce")
     volume = pd.to_numeric(df.get("volume",
              pd.Series(1e6,index=df.index)), errors="coerce").fillna(1e6)
     ret    = close.pct_change()
@@ -246,49 +193,44 @@ def buat_fitur(df, data_asia, fitur_aktif=None):
     cmf    = mfv.rolling(20).sum()/volume.rolling(20).sum().replace(0,np.nan)
 
     f = pd.DataFrame(index=df.index)
-    # Teknikal dasar
-    f["rsi"]             = rsi
-    f["rsi_oversold"]    = (rsi<30).astype(int)
-    f["rsi_overbought"]  = (rsi>70).astype(int)
-    f["macd"]            = macd
-    f["macd_hist"]       = macd-msig
-    f["macd_cross_up"]   = ((macd>msig)&(macd.shift(1)<=msig.shift(1))).astype(int)
-    f["bb_pct"]          = bb
-    f["below_bb"]        = (bb<0).astype(int)
-    f["vol_ratio"]       = vol_r
-    f["vol_spike"]       = (vol_r>2).astype(int)
-    f["akumulasi"]       = ((close>close.shift(1))&(volume>volume.shift(1))).astype(int)
-    f["mfi"]             = mfi
-    f["mfi_oversold"]    = (mfi<20).astype(int)
-    f["cmf"]             = cmf
-    # Return & momentum
-    f["return_lag1"]     = ret.shift(1)
-    f["return_lag2"]     = ret.shift(2)
-    f["return_lag3"]     = ret.shift(3)
-    f["return_3d"]       = ret.rolling(3).sum().shift(1)
-    f["return_5d"]       = ret.rolling(5).sum().shift(1)
-    f["volatility_5d"]   = ret.rolling(5).std()
-    f["volatility_20d"]  = ret.rolling(20).std()
-    f["momentum_5d"]     = close.pct_change(5)
-    f["momentum_20d"]    = close.pct_change(20)
-    f["above_ma20"]      = (close>sma20).astype(int)
-    f["above_ma50"]      = (close>sma50).astype(int)
-    f["pct_vs_ma20"]     = (close-sma20)/sma20.replace(0,np.nan)
-    f["drawdown_5d"]     = close.pct_change(5)
-    f["drawdown_10d"]    = close.pct_change(10)
-    # Kalender
-    f["bulan"]           = df.index.month
-    f["kuartal"]         = df.index.quarter
-    f["hari_minggu"]     = df.index.dayofweek
-    f["hari_tahun"]      = df.index.dayofyear
-    f["awal_bulan"]      = (df.index.day<=5).astype(int)
-    f["akhir_bulan"]     = (df.index.day>=25).astype(int)
-    # Asia (terbukti korelasi dari biostatistik)
+    f["rsi"]           = rsi
+    f["rsi_oversold"]  = (rsi<30).astype(int)
+    f["macd"]          = macd
+    f["macd_hist"]     = macd-msig
+    f["macd_cross_up"] = ((macd>msig)&(macd.shift(1)<=msig.shift(1))).astype(int)
+    f["bb_pct"]        = bb
+    f["below_bb"]      = (bb<0).astype(int)
+    f["vol_ratio"]     = vol_r
+    f["vol_spike"]     = (vol_r>2).astype(int)
+    f["akumulasi"]     = ((close>close.shift(1))&(volume>volume.shift(1))).astype(int)
+    f["mfi"]           = mfi
+    f["mfi_oversold"]  = (mfi<20).astype(int)
+    f["cmf"]           = cmf
+    f["return_lag1"]   = ret.shift(1)
+    f["return_lag2"]   = ret.shift(2)
+    f["return_lag3"]   = ret.shift(3)
+    f["return_3d"]     = ret.rolling(3).sum().shift(1)
+    f["return_5d"]     = ret.rolling(5).sum().shift(1)
+    f["volatility_5d"] = ret.rolling(5).std()
+    f["volatility_20d"]= ret.rolling(20).std()
+    f["momentum_5d"]   = close.pct_change(5)
+    f["momentum_20d"]  = close.pct_change(20)
+    f["above_ma20"]    = (close>sma20).astype(int)
+    f["above_ma50"]    = (close>sma50).astype(int)
+    f["pct_vs_ma20"]   = (close-sma20)/sma20.replace(0,np.nan)
+    f["drawdown_10d"]  = close.pct_change(10)
+    f["bulan"]         = df.index.month
+    f["kuartal"]       = df.index.quarter
+    f["hari_minggu"]   = df.index.dayofweek
+    f["hari_tahun"]    = df.index.dayofyear
+    f["awal_bulan"]    = (df.index.day<=5).astype(int)
+    f["akhir_bulan"]   = (df.index.day>=25).astype(int)
+
     for nama in ["set","hangseng","klci","kospi","sti","sse","nikkei","ftse","dax"]:
         if nama not in data_asia: continue
-        s    = data_asia[nama].reindex(df.index, method="ffill")
-        r_a  = s.pct_change()
-        ma5  = s.rolling(5,min_periods=1).mean()
+        s   = data_asia[nama].reindex(df.index, method="ffill")
+        r_a = s.pct_change()
+        ma5 = s.rolling(5,min_periods=1).mean()
         f[f"{nama}_ret"]   = r_a
         f[f"{nama}_lag1"]  = r_a.shift(1)
         f[f"{nama}_trend"] = (s-ma5)/ma5.replace(0,np.nan)
@@ -299,29 +241,22 @@ def buat_fitur(df, data_asia, fitur_aktif=None):
         f[f"{nama}_ret"]  = r_a
         f[f"{nama}_lag1"] = r_a.shift(1)
         if nama=="usdidr":
-            f["rupiah_lemah"]   = (s>16500).astype(int)
-            f["rupiah_stabil"]  = (r_a.rolling(3).std()<0.003).astype(int)
+            f["rupiah_lemah"]  = (s>16500).astype(int)
+            f["rupiah_stabil"] = (r_a.rolling(3).std()<0.003).astype(int)
     for nama in ["vvix","dowjones","brent"]:
         if nama not in data_asia: continue
         s   = data_asia[nama].reindex(df.index, method="ffill")
         r_a = s.pct_change()
         f[f"{nama}_lag1"] = r_a.shift(1)
         if nama=="vvix":
-            f["vvix_level"]  = s
             f["vvix_tinggi"] = (s.shift(1)>100).astype(int)
             f["vvix_panik"]  = (s.shift(1)>120).astype(int)
             f["vvix_turun"]  = ((s<s.shift(1))&(s.shift(1)>30)).astype(int)
         if nama=="brent":
             f["brent_spike"] = (r_a.shift(1)>0.03).astype(int)
-
-    # Filter fitur aktif jika ada
-    if fitur_aktif:
-        cols = [c for c in fitur_aktif if c in f.columns]
-        return f[cols]
     return f
 
-# ── Dataset ───────────────────────────────────────────────────
-def buat_dataset_kode(kode, data_asia, min_hari=300, fitur_aktif=None):
+def buat_dataset(kode, data_asia, min_hari=300):
     for path in [f"data/{kode}.csv",f"data/biostatistik/saham/{kode}.csv"]:
         if not os.path.exists(path): continue
         try:
@@ -334,33 +269,17 @@ def buat_dataset_kode(kode, data_asia, min_hari=300, fitur_aktif=None):
                     df[col] = pd.to_numeric(df[col], errors="coerce")
             df = df.dropna(subset=["close"])
             if len(df) < min_hari: return None, None
-            df["target"] = (df["close"].shift(-1) > df["close"]).astype(int)
-            X = buat_fitur(df, data_asia, fitur_aktif)
+            df["target"] = (df["close"].shift(-1)>df["close"]).astype(int)
+            X = buat_fitur(df, data_asia)
             y = df["target"]
-            valid = y.notna() & (X.isna().sum(axis=1) < X.shape[1]*0.4)
+            valid = y.notna()&(X.isna().sum(axis=1)<X.shape[1]*0.4)
             X = X[valid].fillna(0)
             y = y[valid]
             return (X,y) if len(X)>=100 else (None,None)
         except: continue
     return None, None
 
-# ══════════════════════════════════════════════════════════════
-# 5 STRATEGI BERBEDA — ROTASI SETIAP HARI
-# ══════════════════════════════════════════════════════════════
-STRATEGI = [
-    # (nama, min_hari, trees, depth, leaves, algo)
-    ("RF-Standard",   300,  300, 10, 15, "rf"),
-    ("RF-Deep",       300,  400, 14,  8, "rf"),
-    ("RF-Shallow",    500,  200,  6, 25, "rf"),
-    ("RF-ManyTrees",  300,  600,  8, 20, "rf"),
-    ("GB-Boost",      400,  200,  5, 20, "gb"),
-]
-
-def train_dengan_strategi(idx_strategi, data_asia, fitur_aktif=None):
-    nama, min_hari, trees, depth, leaves, algo = STRATEGI[idx_strategi]
-    print(f"  Strategi: {nama} | min_hari={min_hari} trees={trees} depth={depth}")
-
-    # Scan saham
+def scan_saham():
     SKIP = ["KOMODITAS","MAKRO","CUACA","ENSO","KALENDER","GABUNGAN",
             "BDI","IHSG","KOSPI","STI_","KLCI","Nikkei","HangSeng",
             "SSE","SET_","SP500","DowJones","NASDAQ","FTSE","DAX",
@@ -376,20 +295,31 @@ def train_dengan_strategi(idx_strategi, data_asia, fitur_aktif=None):
             if any(x.lower() in fname.lower() for x in SKIP): continue
             k = fname.replace(".csv","")
             if len(k)<=6 and k.isupper(): semua.add(k)
-
     per_sektor = {}
     for k in sorted(semua):
         sek = SEKTOR.get(k,"lainnya")
         per_sektor.setdefault(sek,[]).append(k)
+    return per_sektor
 
-    models  = {}
-    hasil   = []
-    imp_all = []
+# ── 5 Strategi berbeda ────────────────────────────────────────
+STRATEGI = [
+    # nama,          min_hari, trees, depth, leaves, algo
+    ("RF-Standard",   300,     300,   10,    15,     "rf"),
+    ("RF-Deep",       300,     400,   14,     8,     "rf"),
+    ("RF-Shallow",    500,     200,    6,    25,     "rf"),
+    ("RF-ManyTrees",  300,     600,    8,    20,     "rf"),
+    ("GB-Boost",      400,     200,    5,    20,     "gb"),
+]
+
+def train_satu_strategi(idx, data_asia, per_sektor):
+    nama, min_hari, trees, depth, leaves, algo = STRATEGI[idx]
+    hasil = []
+    models = {}
 
     for sektor, saham_list in sorted(per_sektor.items()):
         X_all, y_all = [], []
         for kode in saham_list:
-            X, y = buat_dataset_kode(kode, data_asia, min_hari, fitur_aktif)
+            X, y = buat_dataset(kode, data_asia, min_hari)
             if X is not None:
                 X_all.append(X); y_all.append(y)
         if not X_all: continue
@@ -398,7 +328,7 @@ def train_dengan_strategi(idx_strategi, data_asia, fitur_aktif=None):
         y_c = pd.concat(y_all)
         X_c = X_c.loc[:, X_c.nunique()>1]
 
-        if algo == "rf":
+        if algo=="rf":
             clf = RandomForestClassifier(
                 n_estimators=trees, max_depth=depth,
                 min_samples_leaf=leaves, max_features="sqrt",
@@ -409,8 +339,7 @@ def train_dengan_strategi(idx_strategi, data_asia, fitur_aktif=None):
                 learning_rate=0.05, subsample=0.8, random_state=42)
 
         model = Pipeline([("scaler",StandardScaler()),("clf",clf)])
-
-        tscv = TimeSeriesSplit(n_splits=5)
+        tscv  = TimeSeriesSplit(n_splits=5)
         try:
             scores = cross_val_score(model, X_c, y_c, cv=tscv,
                                       scoring="accuracy", n_jobs=-1)
@@ -419,293 +348,212 @@ def train_dengan_strategi(idx_strategi, data_asia, fitur_aktif=None):
             cv = 0
 
         model.fit(X_c, y_c)
-
-        # Feature importance
-        try:
-            imp = model.named_steps["clf"].feature_importances_
-            for fname_i, imp_i in zip(X_c.columns, imp):
-                imp_all.append({"fitur":fname_i,"importance":imp_i,"sektor":sektor})
-        except: pass
-
         models[sektor] = {
             "pipeline": model, "fitur": X_c.columns.tolist(),
-            "cv_accuracy": cv, "n_data": len(X_c), "n_saham": len(X_all)
+            "cv_accuracy": cv, "n_data": len(X_c),
         }
-        hasil.append({"sektor":sektor,"cv":cv,"n":len(X_all)})
-        print(f"    {sektor}: CV={cv:.4f} ({len(X_all)} saham)")
+        hasil.append({"sektor":sektor,"cv":cv})
 
     avg = round(float(np.mean([h["cv"] for h in hasil])),4) if hasil else 0
-
-    # Rekap feature importance global
-    df_imp = pd.DataFrame(imp_all)
-    if len(df_imp) > 0:
-        df_imp = df_imp.groupby("fitur")["importance"].mean().sort_values(
-            ascending=False).reset_index()
-        df_imp.to_csv("logs/brain/feature_importance.csv", index=False)
-
-    return models, avg, hasil, df_imp if len(df_imp)>0 else pd.DataFrame()
+    return models, avg, hasil
 
 # ══════════════════════════════════════════════════════════════
-# EVALUASI PREDIKSI KEMARIN
+# FUNGSI UTAMA — dipanggil jadwal
 # ══════════════════════════════════════════════════════════════
-def evaluasi_prediksi_kemarin():
-    """Bandingkan prediksi kemarin dengan harga aktual hari ini."""
-    if not os.path.exists(PRED_LOG):
-        return None
+def training_loop():
+    """
+    07:00 WIB: mulai training loop.
+    Coba semua strategi satu per satu.
+    Berhenti kalau:
+    1. Sudah menemukan model lebih baik dari best_acc
+    2. Sudah mencapai TARGET_ACC (66%)
+    3. Sudah jam 21:45 WIB (batas waktu sebelum laporan)
+    Hasilnya disimpan dan siap dilaporkan jam 22:00.
+    """
+    tanggal   = datetime.now().strftime("%Y-%m-%d")
+    state     = load_state()
+    best_acc  = load_best_acc()
+    batas_jam = datetime.now().replace(hour=21, minute=45, second=0)
 
-    df_pred = pd.read_csv(PRED_LOG)
-    if len(df_pred) == 0:
-        return None
-
-    kemarin = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    df_k    = df_pred[df_pred["tanggal_prediksi"] == kemarin]
-    if len(df_k) == 0:
-        return None
-
-    benar = 0
-    total = 0
-    hasil = []
-    for _, row in df_k.iterrows():
-        kode = row["ticker"]
-        path = f"data/{kode}.csv"
-        if not os.path.exists(path): continue
-        df_s = pd.read_csv(path)
-        df_s["date"] = pd.to_datetime(df_s["date"])
-        df_s = df_s.set_index("date").sort_index()
-        hari_ini = datetime.now().strftime("%Y-%m-%d")
-        if hari_ini not in df_s.index.strftime("%Y-%m-%d"): continue
-        close_kemarin = float(row["harga"])
-        close_hari_ini= float(df_s["close"].iloc[-1])
-        aktual_naik   = close_hari_ini > close_kemarin
-        pred_naik     = row["sinyal"] in ["BELI","PANTAU"]
-        cocok = aktual_naik == pred_naik
-        if cocok: benar += 1
-        total += 1
-        hasil.append({
-            "ticker"  : kode,
-            "pred"    : row["sinyal"],
-            "aktual"  : "NAIK" if aktual_naik else "TURUN",
-            "chg_pct" : round((close_hari_ini-close_kemarin)/close_kemarin*100,2),
-            "benar"   : cocok,
-        })
-
-    acc_real = benar/total if total > 0 else 0
-    return {"acc_real": acc_real, "total": total, "benar": benar, "detail": hasil}
-
-# ── Simpan prediksi hari ini ──────────────────────────────────
-def simpan_prediksi(tanggal, ticker, harga, sinyal, skor):
-    row = pd.DataFrame([{
-        "tanggal_prediksi": tanggal,
-        "ticker": ticker,
-        "harga": harga,
-        "sinyal": sinyal,
-        "skor": skor
-    }])
-    if os.path.exists(PRED_LOG):
-        df = pd.read_csv(PRED_LOG)
-        df = pd.concat([df,row]).tail(500)  # simpan 500 prediksi terakhir
-    else:
-        df = row
-    df.to_csv(PRED_LOG, index=False)
-
-# ══════════════════════════════════════════════════════════════
-# FUNGSI UTAMA — dipanggil oleh jadwal
-# ══════════════════════════════════════════════════════════════
-def download_data():
-    """08:00 WIB — Update data saham."""
-    print(f"[{datetime.now().strftime('%H:%M')}] Download data saham...")
-    ok = update_data_saham()
-    print(f"  {ok} saham diupdate")
-
-def scoring_harian():
-    """08:15 WIB — Scoring dan kirim sinyal ke Telegram."""
-    # Import dari main.py yang sudah ada
-    try:
-        from main import scoring_harian as scoring_lama
-        scoring_lama()
-    except:
-        print("Scoring tidak bisa dijalankan dari brain.py")
-
-def evaluasi_dan_belajar():
-    """21:00-23:30 WIB — Evaluasi + belajar + laporan."""
-    tanggal = datetime.now().strftime("%Y-%m-%d")
     print(f"\n{'='*60}")
-    print(f"BRAIN AUTO LEARNING — {tanggal}")
+    print(f"BRAIN TRAINING LOOP — {tanggal}")
+    print(f"Best acc saat ini: {best_acc*100:.2f}%")
+    print(f"Target           : {TARGET_ACC*100:.0f}%")
+    print(f"Batas waktu      : 21:45 WIB")
     print(f"{'='*60}")
 
-    state      = load_state()
-    best_acc   = load_best_acc()
-    hari_ke    = state["hari_ke"]
-    idx_strat  = state["strategi_index"] % len(STRATEGI)
+    # Download Asia sekali di awal
+    print("\nDownload pasar Asia...")
+    data_asia  = download_asia()
+    per_sektor = scan_saham()
+    total_saham = sum(len(v) for v in per_sektor.values())
+    print(f"Scan: {total_saham} saham, {len(per_sektor)} sektor")
 
-    # ── Step 1: Evaluasi prediksi kemarin ────────────────────
-    print("\n[1/4] Evaluasi prediksi kemarin...")
-    eval_result = evaluasi_prediksi_kemarin()
-    if eval_result:
-        acc_real = eval_result["acc_real"]
-        print(f"  Akurasi real: {acc_real*100:.1f}% "
-              f"({eval_result['benar']}/{eval_result['total']})")
-        state["akurasi_7hari"].append(round(acc_real,4))
-        state["akurasi_7hari"] = state["akurasi_7hari"][-7:]
-    else:
-        acc_real = None
-        print("  Tidak ada data evaluasi kemarin")
+    hasil_semua   = []
+    model_terbaik = None
+    acc_terbaik   = best_acc
+    strategi_menang = "-"
+    deployed      = False
 
-    # ── Step 2: Download data Asia ────────────────────────────
-    print("\n[2/4] Download pasar Asia...")
-    tickers_asia = {
-        "^SET.BK":"set","^HSI":"hangseng","^KLSE":"klci",
-        "^KS11":"kospi","^STI":"sti","000001.SS":"sse",
-        "^N225":"nikkei","^FTSE":"ftse","^GDAXI":"dax",
-        "USDIDR=X":"usdidr","JPYIDR=X":"jpyidr",
-        "^VVIX":"vvix","^DJI":"dowjones","BZ=F":"brent",
-    }
-    data_asia = {}
-    for ticker, nama in tickers_asia.items():
-        s = yahoo(ticker)
-        if s is not None: data_asia[nama] = s
-        time.sleep(0.5)
-    print(f"  {len(data_asia)}/14 sumber berhasil")
+    # Loop semua strategi
+    for idx, (nama, min_hari, trees, depth, leaves, algo) in enumerate(STRATEGI):
+        # Cek batas waktu
+        if datetime.now() >= batas_jam:
+            print(f"\nBatas waktu 21:45 tercapai, stop training")
+            break
 
-    # ── Step 3: Pilih fitur terbaik (dari history) ───────────
-    fitur_aktif = None
-    imp_path = "logs/brain/feature_importance.csv"
-    if os.path.exists(imp_path) and hari_ke > 0:
-        df_imp = pd.read_csv(imp_path)
-        if len(df_imp) > 20:
-            # Ambil top 80% fitur berdasarkan importance
-            df_imp = df_imp.sort_values("importance",ascending=False)
-            cum_imp = df_imp["importance"].cumsum() / df_imp["importance"].sum()
-            cutoff  = df_imp[cum_imp <= 0.95].index[-1]
-            fitur_aktif = df_imp.loc[:cutoff,"fitur"].tolist()
-            print(f"  Pakai {len(fitur_aktif)} fitur terbaik "
-                  f"(dari {len(df_imp)} total)")
+        print(f"\n[{idx+1}/{len(STRATEGI)}] Strategi: {nama}")
+        print(f"  min_hari={min_hari} trees={trees} depth={depth} algo={algo}")
 
-    # ── Step 4: Training dengan strategi hari ini ────────────
-    nama_strat = STRATEGI[idx_strat][0]
-    print(f"\n[3/4] Training strategi {idx_strat+1}/{len(STRATEGI)}: {nama_strat}...")
-    waktu_mulai = datetime.now()
+        waktu_mulai = datetime.now()
+        try:
+            models, avg_cv, hasil = train_satu_strategi(idx, data_asia, per_sektor)
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            continue
 
-    models_baru, avg_cv, hasil_sektor, df_imp = train_dengan_strategi(
-        idx_strat, data_asia, fitur_aktif)
+        durasi = (datetime.now()-waktu_mulai).seconds//60
+        print(f"  CV={avg_cv*100:.2f}% | Durasi={durasi} menit")
 
-    durasi_menit = (datetime.now()-waktu_mulai).seconds//60
-    print(f"  Akurasi CV rata-rata: {avg_cv*100:.2f}%")
-    print(f"  Durasi: {durasi_menit} menit")
+        hasil_semua.append({
+            "strategi": nama,
+            "cv"      : avg_cv,
+            "durasi"  : durasi,
+        })
 
-    # ── Step 5: Update model jika lebih baik ─────────────────
-    print(f"\n[4/4] Evaluasi dan simpan...")
-    deployed = False
-    catatan  = ""
+        state["total_training"] += 1
 
-    if avg_cv > best_acc:
-        import shutil
-        path_baru = f"models/models_brain_{tanggal.replace('-','')}.pkl"
-        with open(path_baru,"wb") as f:
-            pickle.dump(models_baru, f)
-        shutil.copy(path_baru, "models/models_latest.pkl")
-        save_best_acc(avg_cv)
-        deployed = True
-        delta = (avg_cv - best_acc)*100
-        catatan = f"✅ NAIK {delta:+.2f}% ({best_acc*100:.2f}%→{avg_cv*100:.2f}%)"
-        print(f"  {catatan}")
-        best_acc = avg_cv
-    else:
-        import shutil
-        if os.path.exists("models/models_final.pkl"):
-            shutil.copy("models/models_final.pkl","models/models_latest.pkl")
-        delta = (avg_cv - best_acc)*100
-        catatan = f"⚠️ Belum naik ({delta:.2f}%), model terbaik tetap"
-        print(f"  {catatan}")
+        # Simpan kalau lebih baik dari sebelumnya
+        if avg_cv > acc_terbaik:
+            acc_terbaik     = avg_cv
+            model_terbaik   = models
+            strategi_menang = nama
+            print(f"  ✅ LEBIH BAIK! {best_acc*100:.2f}% -> {avg_cv*100:.2f}%")
 
-    # ── Update state ──────────────────────────────────────────
-    state["hari_ke"]        += 1
-    state["strategi_index"] += 1
-    state["total_training"] += 1
-    if deployed: state["total_deploy"] += 1
-    state["catatan"] = ([catatan] + state.get("catatan",[]  ))[:30]
+            # Update model seketika
+            import shutil
+            path_baru = f"models/models_brain_{tanggal.replace('-','')}.pkl"
+            with open(path_baru,"wb") as f_:
+                pickle.dump(models, f_)
+            shutil.copy(path_baru, "models/models_latest.pkl")
+            save_best_acc(acc_terbaik)
+            deployed = True
+            state["total_deploy"] += 1
+
+            # Kalau sudah capai target, stop
+            if avg_cv >= TARGET_ACC:
+                print(f"\n🎯 TARGET {TARGET_ACC*100:.0f}% TERCAPAI!")
+                break
+        else:
+            print(f"  Belum lebih baik dari {acc_terbaik*100:.2f}%")
+
+    # Simpan state
+    state["hari_ke"]       += 1
+    state["riwayat_cv"]     = (state.get("riwayat_cv",[]) + [acc_terbaik])[-30:]
+    state["strategi_index"] = (state.get("strategi_index",0) + len(hasil_semua)) % len(STRATEGI)
     save_state(state)
 
-    # Simpan ke history
-    row = {
-        "tanggal"    : tanggal,
-        "strategi"   : nama_strat,
-        "cv_accuracy": avg_cv,
-        "acc_real"   : acc_real,
-        "deployed"   : deployed,
-        "durasi"     : durasi_menit,
+    # Simpan history
+    simpan_history({
+        "tanggal"         : tanggal,
+        "cv_terbaik"      : acc_terbaik,
+        "strategi_menang" : strategi_menang,
+        "deployed"        : deployed,
+        "total_strategi"  : len(hasil_semua),
+    })
+
+    # Simpan hasil untuk laporan jam 22:00
+    laporan_data = {
+        "tanggal"        : tanggal,
+        "best_acc"       : acc_terbaik,
+        "deployed"       : deployed,
+        "strategi_menang": strategi_menang,
+        "hasil_semua"    : hasil_semua,
+        "total_training" : state["total_training"],
+        "total_deploy"   : state["total_deploy"],
+        "riwayat_cv"     : state["riwayat_cv"],
     }
-    df_hist = pd.read_csv(HISTORY) if os.path.exists(HISTORY) else pd.DataFrame()
-    df_hist = pd.concat([df_hist, pd.DataFrame([row])], ignore_index=True)
-    df_hist.to_csv(HISTORY, index=False)
+    with open("logs/brain/laporan_hari_ini.json","w") as f:
+        json.dump(laporan_data, f, indent=2)
 
-    # ── Laporan Telegram ──────────────────────────────────────
-    sektor_sorted = sorted(hasil_sektor, key=lambda x:-x["cv"])
-    best_s  = sektor_sorted[0] if sektor_sorted else {"sektor":"-","cv":0}
-    worst_s = sektor_sorted[-1] if sektor_sorted else {"sektor":"-","cv":0}
+    print(f"\nTraining selesai. Laporan akan dikirim jam 22:00 WIB.")
+    return acc_terbaik, deployed
 
-    # Tren 7 hari
-    akurasi_7h = state.get("akurasi_7hari",[])
-    tren_str = ""
-    if len(akurasi_7h) >= 2:
-        delta_7 = (akurasi_7h[-1] - akurasi_7h[0])*100 if len(akurasi_7h)>1 else 0
-        tren_str = f"Tren 7 hari: {'▲' if delta_7>0 else '▼'} {abs(delta_7):.2f}%\n"
+def kirim_laporan():
+    """22:00 WIB: kirim laporan ke Telegram."""
+    tanggal = datetime.now().strftime("%Y-%m-%d")
 
-    # Progress bar
-    target = 0.66
-    progress = max(0,min(100,(avg_cv-0.6045)/(target-0.6045)*100))
-    bar = "█"*int(progress/5) + "░"*(20-int(progress/5))
+    # Load hasil training hari ini
+    laporan_path = "logs/brain/laporan_hari_ini.json"
+    if not os.path.exists(laporan_path):
+        telegram(
+            f"🧠 <b>LAPORAN BRAIN — {tanggal}</b>\n\n"
+            f"⚠️ Tidak ada data training hari ini.\n"
+            f"Kemungkinan training belum selesai atau terjadi error."
+        )
+        return
 
-    # Hari berikutnya
-    next_strat = STRATEGI[(idx_strat+1)%len(STRATEGI)][0]
+    with open(laporan_path) as f:
+        d = json.load(f)
 
-    # Top fitur
-    top_fitur = ""
-    if len(df_imp) > 0:
-        top3 = df_imp.head(3)["fitur"].tolist()
-        top_fitur = f"🔍 Top fitur: {', '.join(top3)}\n"
+    best_acc  = d["best_acc"]
+    deployed  = d["deployed"]
+    menang    = d["strategi_menang"]
+    hasil     = d["hasil_semua"]
+    riwayat   = d.get("riwayat_cv",[])
 
-    # Evaluasi real kemarin
-    eval_str = ""
-    if acc_real is not None:
-        eval_str = (f"📊 Akurasi real kemarin: {acc_real*100:.1f}%\n"
-                    f"   ({eval_result['benar']}/{eval_result['total']} prediksi benar)\n")
+    # Progress bar ke target 66%
+    progress = max(0, min(100, (best_acc-BASELINE_ACC)/(TARGET_ACC-BASELINE_ACC)*100))
+    bar      = "█"*int(progress/5) + "░"*(20-int(progress/5))
+
+    # Tren
+    tren = ""
+    if len(riwayat) >= 2:
+        delta = (riwayat[-1]-riwayat[-2])*100
+        tren  = f"{'▲' if delta>0 else '▼'} {abs(delta):.2f}% vs kemarin"
+
+    # Detail strategi
+    detail = ""
+    for h in hasil:
+        flag = "✅" if h["cv"]>BASELINE_ACC else "❌"
+        detail += f"{flag} {h['strategi']}: {h['cv']*100:.2f}% ({h['durasi']}m)\n"
+
+    # Status
+    if best_acc >= TARGET_ACC:
+        status_msg = f"🎯 <b>TARGET {TARGET_ACC*100:.0f}% TERCAPAI!</b>"
+    elif deployed:
+        delta = (best_acc - BASELINE_ACC)*100
+        status_msg = f"✅ Model diupdate! +{delta:.2f}% dari baseline"
+    else:
+        status_msg = f"⚠️ Belum ada peningkatan hari ini"
 
     msg = (
-        f"🧠 <b>BRAIN LAPORAN HARIAN</b>\n"
-        f"📅 {tanggal} | Hari ke-{state['hari_ke']}\n"
+        f"🧠 <b>LAPORAN BRAIN HARIAN</b>\n"
+        f"📅 {tanggal}\n"
         f"{'─'*32}\n"
-        f"🎯 <b>CV Akurasi: {avg_cv*100:.2f}%</b>\n"
-        f"{eval_str}"
-        f"{tren_str}"
+        f"🎯 <b>Akurasi terbaik: {best_acc*100:.2f}%</b>\n"
+        f"📈 {tren}\n"
+        f"{status_msg}\n"
         f"{'─'*32}\n"
-        f"🔬 Strategi hari ini: {nama_strat}\n"
-        f"📈 Terbaik: {best_s['sektor']} ({best_s['cv']*100:.1f}%)\n"
-        f"📉 Perlu perhatian: {worst_s['sektor']} ({worst_s['cv']*100:.1f}%)\n"
-        f"{top_fitur}"
+        f"🔬 Hasil training hari ini:\n"
+        f"{detail}"
         f"{'─'*32}\n"
-        f"💾 {catatan}\n"
-        f"🏆 Akurasi terbaik: {best_acc*100:.2f}%\n"
-        f"📦 Total training: {state['total_training']} | Deploy: {state['total_deploy']}\n"
+        f"🏆 Strategi terbaik: {menang}\n"
+        f"📦 Total training: {d['total_training']} | Deploy: {d['total_deploy']}\n"
         f"{'─'*32}\n"
-        f"Progress ke 66%:\n"
+        f"📊 Progress ke {TARGET_ACC*100:.0f}%:\n"
         f"[{bar}] {progress:.0f}%\n"
-        f"Gap: {(target-avg_cv)*100:.2f}% lagi\n"
+        f"Gap: {(TARGET_ACC-best_acc)*100:.2f}% lagi\n"
         f"{'─'*32}\n"
-        f"🔮 Strategi besok: {next_strat}\n"
-        f"⏰ Laporan berikut: besok 23:30 WIB"
+        f"⏰ Training besok mulai 07:00 WIB"
     )
     telegram(msg)
-    print(f"\nLaporan terkirim ke Telegram!")
-    return avg_cv
 
-# ── Entry point langsung ──────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
-    cmd = sys.argv[1] if len(sys.argv)>1 else "learn"
-    if cmd == "download":
-        download_data()
-    elif cmd == "learn":
-        evaluasi_dan_belajar()
+    cmd = sys.argv[1] if len(sys.argv)>1 else "train"
+    if cmd == "laporan":
+        kirim_laporan()
     else:
-        evaluasi_dan_belajar()
+        training_loop()
