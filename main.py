@@ -596,6 +596,7 @@ def jalankan_jadwal():
     print("Jadwal aktif: 08:00 WIB download | 08:15 WIB scoring | 15:30 WIB evaluasi")
     
 # ── Auto retrain mingguan ──────────────────────────────────────
+AUTO_RETRAIN_OK = False
 if AUTO_RETRAIN_OK:
     schedule.every().sunday.at("19:00").do(jalankan_retrain)
     print("[JADWAL] Auto retrain: setiap Minggu 02:00 WIB")
