@@ -603,6 +603,7 @@ if AUTO_RETRAIN_OK:
 
 
 # ── Jadwal Brain ────────────────────────────────────────────
+BRAIN_OK = False
 if BRAIN_OK:
     # 08:00 WIB = 01:00 UTC
     schedule.every().day.at('01:00').do(brain_download)
