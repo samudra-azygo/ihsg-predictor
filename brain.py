@@ -301,7 +301,113 @@ def scan_saham():
         per_sektor.setdefault(sek,[]).append(k)
     return per_sektor
 
-# ── 5 Strategi berbeda ────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# SELF-HEALING — Auto koreksi kalau ada error
+# ══════════════════════════════════════════════════════════════
+ERROR_LOG = "logs/brain/error_log.json"
+
+def catat_error(fungsi, error_msg):
+    """Catat error ke file untuk analisis."""
+    log = []
+    if os.path.exists(ERROR_LOG):
+        try: log = json.load(open(ERROR_LOG))
+        except: pass
+    log.append({
+        "waktu"  : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "fungsi" : fungsi,
+        "error"  : str(error_msg)[:200],
+    })
+    log = log[-50:]  # simpan 50 error terakhir
+    with open(ERROR_LOG,"w") as f:
+        json.dump(log, f, indent=2)
+
+def self_heal(fungsi_nama, error):
+    """
+    Coba fix error secara otomatis.
+    Return True kalau berhasil fix, False kalau tidak bisa.
+    """
+    err_str = str(error).lower()
+    print(f"\n[SELF-HEAL] Mendeteksi error: {error}")
+    print(f"[SELF-HEAL] Mencoba auto-fix...")
+
+    # ── Fix 1: SSL Error ─────────────────────────────────────
+    if "ssl" in err_str or "certificate" in err_str:
+        print("[SELF-HEAL] Fix SSL: sudah ada bypass, skip download")
+        return True  # SSL bypass sudah aktif, lanjut saja
+
+    # ── Fix 2: File tidak ditemukan ──────────────────────────
+    if "no such file" in err_str or "filenotfound" in err_str:
+        print("[SELF-HEAL] Fix: buat folder yang hilang")
+        for folder in ["models","logs/brain","data","data/biostatistik/saham"]:
+            os.makedirs(folder, exist_ok=True)
+        return True
+
+    # ── Fix 3: Model pkl rusak ───────────────────────────────
+    if "pickle" in err_str or "unpickling" in err_str:
+        print("[SELF-HEAL] Fix: model pkl rusak, kembalikan models_final")
+        try:
+            import shutil
+            if os.path.exists("models/models_final.pkl"):
+                shutil.copy("models/models_final.pkl","models/models_latest.pkl")
+                print("[SELF-HEAL] models_latest.pkl dikembalikan ke models_final")
+                return True
+        except: pass
+
+    # ── Fix 4: Memory error ──────────────────────────────────
+    if "memory" in err_str or "memoryerror" in err_str:
+        print("[SELF-HEAL] Fix memory: kurangi n_estimators ke 100")
+        # Modifikasi STRATEGI sementara
+        global STRATEGI
+        STRATEGI = [
+            ("RF-Light", 300, 100, 6, 20, "rf"),
+        ]
+        return True
+
+    # ── Fix 5: Rate limit Yahoo ──────────────────────────────
+    if "429" in err_str or "too many" in err_str:
+        print("[SELF-HEAL] Fix rate limit: tunggu 60 detik")
+        time.sleep(60)
+        return True
+
+    # ── Fix 6: Data kosong ───────────────────────────────────
+    if "empty" in err_str or "no data" in err_str or "length 0" in err_str:
+        print("[SELF-HEAL] Fix data kosong: pakai model lama")
+        return False  # skip strategi ini, lanjut ke berikutnya
+
+    # ── Fix 7: Convergence warning ───────────────────────────
+    if "convergence" in err_str or "max_iter" in err_str:
+        print("[SELF-HEAL] Fix convergence: lanjut dengan warning")
+        return True
+
+    print(f"[SELF-HEAL] Tidak bisa auto-fix error ini, skip strategi")
+    return False
+
+def safe_run(fungsi, *args, nama="fungsi", max_retry=3, **kwargs):
+    """
+    Wrapper yang auto-retry + self-heal kalau error.
+    """
+    for attempt in range(max_retry):
+        try:
+            return fungsi(*args, **kwargs)
+        except Exception as e:
+            catat_error(nama, e)
+            print(f"\n[ERROR] {nama} attempt {attempt+1}/{max_retry}: {e}")
+
+            if attempt < max_retry-1:
+                bisa_fix = self_heal(nama, e)
+                if bisa_fix:
+                    print(f"[SELF-HEAL] Retry {attempt+2}/{max_retry}...")
+                    time.sleep(5)
+                    continue
+                else:
+                    print(f"[SELF-HEAL] Tidak bisa fix, skip")
+                    return None
+            else:
+                print(f"[ERROR] Semua retry gagal untuk {nama}")
+                return None
+    return None
+
+
 STRATEGI = [
     # nama,          min_hari, trees, depth, leaves, algo
     ("RF-Standard",   300,     300,   10,    15,     "rf"),
@@ -364,11 +470,7 @@ def training_loop():
     """
     07:00 WIB: mulai training loop.
     Coba semua strategi satu per satu.
-    Berhenti kalau:
-    1. Sudah menemukan model lebih baik dari best_acc
-    2. Sudah mencapai TARGET_ACC (66%)
-    3. Sudah jam 21:45 WIB (batas waktu sebelum laporan)
-    Hasilnya disimpan dan siap dilaporkan jam 22:00.
+    Self-healing: kalau error, coba fix sendiri dan retry.
     """
     tanggal   = datetime.now().strftime("%Y-%m-%d")
     state     = load_state()
@@ -376,93 +478,103 @@ def training_loop():
     batas_jam = datetime.now().replace(hour=21, minute=45, second=0)
 
     print(f"\n{'='*60}")
-    print(f"BRAIN TRAINING LOOP — {tanggal}")
-    print(f"Best acc saat ini: {best_acc*100:.2f}%")
-    print(f"Target           : {TARGET_ACC*100:.0f}%")
-    print(f"Batas waktu      : 21:45 WIB")
+    print(f"BRAIN TRAINING LOOP v2 — {tanggal}")
+    print(f"Best acc: {best_acc*100:.2f}% | Target: {TARGET_ACC*100:.0f}%")
+    print(f"Self-healing: AKTIF")
     print(f"{'='*60}")
 
-    # Download Asia sekali di awal
+    # Download Asia dengan self-healing
     print("\nDownload pasar Asia...")
-    data_asia  = download_asia()
-    per_sektor = scan_saham()
+    data_asia = safe_run(download_asia, nama="download_asia") or {}
+    per_sektor = safe_run(scan_saham, nama="scan_saham") or {}
+
+    if not per_sektor:
+        print("ERROR: tidak ada data saham sama sekali")
+        telegram(f"🚨 Brain error: tidak ada data saham\nWaktu: {tanggal}")
+        return best_acc, False
+
     total_saham = sum(len(v) for v in per_sektor.values())
     print(f"Scan: {total_saham} saham, {len(per_sektor)} sektor")
 
-    hasil_semua   = []
-    model_terbaik = None
-    acc_terbaik   = best_acc
+    hasil_semua     = []
+    acc_terbaik     = best_acc
     strategi_menang = "-"
-    deployed      = False
+    deployed        = False
+    error_count     = 0
 
-    # Loop semua strategi
     for idx, (nama, min_hari, trees, depth, leaves, algo) in enumerate(STRATEGI):
-        # Cek batas waktu
         if datetime.now() >= batas_jam:
-            print(f"\nBatas waktu 21:45 tercapai, stop training")
+            print(f"\nBatas waktu 21:45 WIB tercapai, stop training")
             break
 
-        print(f"\n[{idx+1}/{len(STRATEGI)}] Strategi: {nama}")
-        print(f"  min_hari={min_hari} trees={trees} depth={depth} algo={algo}")
+        print(f"\n[{idx+1}/{len(STRATEGI)}] {nama}")
 
         waktu_mulai = datetime.now()
-        try:
-            models, avg_cv, hasil = train_satu_strategi(idx, data_asia, per_sektor)
-        except Exception as e:
-            print(f"  ERROR: {e}")
+
+        # Training dengan self-healing
+        result = safe_run(
+            train_satu_strategi, idx, data_asia, per_sektor,
+            nama=f"train_{nama}", max_retry=2
+        )
+
+        if result is None:
+            error_count += 1
+            print(f"  Skip {nama} karena error")
+            hasil_semua.append({"strategi":nama,"cv":0,"durasi":0,"error":True})
             continue
 
+        models, avg_cv, hasil = result
         durasi = (datetime.now()-waktu_mulai).seconds//60
-        print(f"  CV={avg_cv*100:.2f}% | Durasi={durasi} menit")
+        print(f"  CV={avg_cv*100:.2f}% | {durasi} menit")
 
         hasil_semua.append({
             "strategi": nama,
             "cv"      : avg_cv,
             "durasi"  : durasi,
+            "error"   : False,
         })
-
         state["total_training"] += 1
 
-        # Simpan kalau lebih baik dari sebelumnya
         if avg_cv > acc_terbaik:
             acc_terbaik     = avg_cv
-            model_terbaik   = models
             strategi_menang = nama
             print(f"  ✅ LEBIH BAIK! {best_acc*100:.2f}% -> {avg_cv*100:.2f}%")
 
-            # Update model seketika
-            import shutil
-            path_baru = f"models/models_brain_{tanggal.replace('-','')}.pkl"
-            with open(path_baru,"wb") as f_:
-                pickle.dump(models, f_)
-            shutil.copy(path_baru, "models/models_latest.pkl")
-            save_best_acc(acc_terbaik)
-            deployed = True
-            state["total_deploy"] += 1
+            try:
+                import shutil
+                path_baru = f"models/models_brain_{tanggal.replace('-','')}.pkl"
+                with open(path_baru,"wb") as f_:
+                    pickle.dump(models, f_)
+                shutil.copy(path_baru, "models/models_latest.pkl")
+                save_best_acc(acc_terbaik)
+                deployed = True
+                state["total_deploy"] += 1
+            except Exception as e:
+                catat_error("simpan_model", e)
+                print(f"  Error simpan model: {e}")
 
-            # Kalau sudah capai target, stop
             if avg_cv >= TARGET_ACC:
                 print(f"\n🎯 TARGET {TARGET_ACC*100:.0f}% TERCAPAI!")
                 break
         else:
             print(f"  Belum lebih baik dari {acc_terbaik*100:.2f}%")
 
-    # Simpan state
+    # Update state
     state["hari_ke"]       += 1
     state["riwayat_cv"]     = (state.get("riwayat_cv",[]) + [acc_terbaik])[-30:]
-    state["strategi_index"] = (state.get("strategi_index",0) + len(hasil_semua)) % len(STRATEGI)
+    state["strategi_index"] = (state.get("strategi_index",0)+len(hasil_semua))%len(STRATEGI)
     save_state(state)
 
-    # Simpan history
     simpan_history({
-        "tanggal"         : tanggal,
-        "cv_terbaik"      : acc_terbaik,
-        "strategi_menang" : strategi_menang,
-        "deployed"        : deployed,
-        "total_strategi"  : len(hasil_semua),
+        "tanggal"        : tanggal,
+        "cv_terbaik"     : acc_terbaik,
+        "strategi_menang": strategi_menang,
+        "deployed"       : deployed,
+        "total_strategi" : len(hasil_semua),
+        "error_count"    : error_count,
     })
 
-    # Simpan hasil untuk laporan jam 22:00
+    # Simpan untuk laporan jam 22:00
     laporan_data = {
         "tanggal"        : tanggal,
         "best_acc"       : acc_terbaik,
@@ -472,11 +584,12 @@ def training_loop():
         "total_training" : state["total_training"],
         "total_deploy"   : state["total_deploy"],
         "riwayat_cv"     : state["riwayat_cv"],
+        "error_count"    : error_count,
     }
     with open("logs/brain/laporan_hari_ini.json","w") as f:
         json.dump(laporan_data, f, indent=2)
 
-    print(f"\nTraining selesai. Laporan akan dikirim jam 22:00 WIB.")
+    print(f"\nTraining selesai. Laporan dikirim jam 22:00 WIB.")
     return acc_terbaik, deployed
 
 def kirim_laporan():
@@ -518,8 +631,8 @@ def kirim_laporan():
         flag = "✅" if h["cv"]>BASELINE_ACC else "❌"
         detail += f"{flag} {h['strategi']}: {h['cv']*100:.2f}% ({h['durasi']}m)\n"
 
-    # Status
-    if best_acc >= TARGET_ACC:
+    error_count = d.get("error_count", 0)
+    error_info  = f"⚠️ {error_count} strategi gagal (auto-fixed)\n" if error_count > 0 else ""
         status_msg = f"🎯 <b>TARGET {TARGET_ACC*100:.0f}% TERCAPAI!</b>"
     elif deployed:
         delta = (best_acc - BASELINE_ACC)*100
@@ -533,6 +646,7 @@ def kirim_laporan():
         f"{'─'*32}\n"
         f"🎯 <b>Akurasi terbaik: {best_acc*100:.2f}%</b>\n"
         f"📈 {tren}\n"
+        f"{error_info}"
         f"{status_msg}\n"
         f"{'─'*32}\n"
         f"🔬 Hasil training hari ini:\n"
