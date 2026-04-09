@@ -282,6 +282,24 @@ def hitung_fitur_teknikal(df):
     cmf_num  = mfv.tail(20).sum()
     cmf_den  = volume.tail(20).sum()
     row["cmf"]           = float(cmf_num / cmf_den) if cmf_den != 0 else 0
+
+    # Fitur rebound tambahan
+    high   = pd.to_numeric(df.get("high", close), errors="coerce")
+    low2   = pd.to_numeric(df.get("low",  close), errors="coerce")
+    low14  = low2.rolling(14).min()
+    high14 = high.rolling(14).max()
+    stoch_k = (close - low14) / (high14 - low14).replace(0, np.nan) * 100
+    stoch_d = stoch_k.rolling(3).mean()
+    row["stoch_k"]        = float(stoch_k.iloc[-1]) if not pd.isna(stoch_k.iloc[-1]) else 50
+    row["stoch_oversold"] = 1 if row["stoch_k"] < 20 else 0
+    row["stoch_cross_up"] = 1 if (stoch_k.iloc[-1] > stoch_d.iloc[-1] and
+                                   stoch_k.iloc[-2] <= stoch_d.iloc[-2] and
+                                   stoch_k.iloc[-1] < 40) else 0
+    row["drawdown_10d"]   = float(close.pct_change(10).iloc[-1]) if len(close) >= 10 else 0
+    row["drawdown_20d"]   = float(close.pct_change(20).iloc[-1]) if len(close) >= 20 else 0
+    vol_r2 = volume / volume.rolling(20).mean().replace(0, np.nan)
+    row["akumulasi"]      = 1 if (close.iloc[-1] > close.iloc[-2] and
+                                   volume.iloc[-1] > volume.tail(5).mean() * 1.5) else 0
     row["momentum_5d"]   = float(close.pct_change(5).iloc[-1]) if len(close) >= 5 else 0
     row["momentum_20d"]  = float(close.pct_change(20).iloc[-1]) if len(close) >= 20 else 0
     row["bulan"]         = df.index[-1].month
@@ -322,6 +340,19 @@ def scoring_improved():
     except Exception as e:
         print(f"  ERROR: {e}")
         return
+
+    # Load model rebound jika ada
+    model_rebound = None
+    fitur_rebound = None
+    if regime == "BEAR":
+        try:
+            with open("models/model_rebound.pkl", "rb") as f:
+                rb = pickle.load(f)
+            model_rebound = rb["pipeline"]
+            fitur_rebound = rb["fitur"]
+            print(f"  ✓ Model rebound dimuat (CV={rb.get('cv_accuracy',0)*100:.1f}%)")
+        except:
+            print(f"  ✗ Model rebound tidak ada — mode krisis nonaktif")
 
     # Step 5: Scoring per saham
     print("\n[4/4] Scoring saham...")
@@ -409,6 +440,23 @@ def scoring_improved():
             if regime == "BEAR" and sinyal == "BELI" and rsi_n < 40:
                 sinyal = "PANTAU"
 
+            # ── MODE KRISIS: cek potensi rebound ──────────────────
+            proba_rebound = 0.0
+            if regime == "BEAR" and model_rebound is not None and fitur_rebound is not None:
+                try:
+                    fitur_rb = {**fitur_makro, **fitur_tek}
+                    X_rb = pd.DataFrame([{
+                        f: fitur_rb.get(f, 0) for f in fitur_rebound
+                    }])
+                    proba_rebound = float(model_rebound.predict_proba(X_rb)[0][1])
+                    # Override SKIP → PANTAU (REBOUND?) jika probabilitas rebound tinggi
+                    if sinyal == "SKIP" and proba_rebound >= 0.55:
+                        sinyal = "PANTAU"
+                    elif sinyal == "PANTAU" and proba_rebound >= 0.65:
+                        sinyal = "BELI"  # konfiden tinggi → upgrade ke BELI
+                except:
+                    proba_rebound = 0.0
+
             hasil.append({
                 "ticker"  : kode,
                 "sektor"  : sektor,
@@ -416,6 +464,7 @@ def scoring_improved():
                 "skor_tek": round(skor_tek, 1),
                 "skor_mak": round(skor_makro, 1),
                 "proba"   : round(proba, 3),
+                "proba_rb": round(proba_rebound, 3),
                 "rsi"     : round(rsi_n, 1),
                 "sinyal"  : sinyal,
             })
@@ -431,17 +480,21 @@ def scoring_improved():
     top10  = df_hasil.head(10)
     beli   = df_hasil[df_hasil["sinyal"] == "BELI"]
     pantau = df_hasil[df_hasil["sinyal"] == "PANTAU"]
+    rebound_candidates = df_hasil[df_hasil["proba_rb"] >= 0.55].head(5) if "proba_rb" in df_hasil.columns else pd.DataFrame()
 
     LINE = "─" * 70
     print(f"\n{LINE}")
     print(f"TOP 10 SAHAM — {tanggal} | Regime: {regime} | Thr.BELI: {thr_beli}")
+    if regime == "BEAR" and model_rebound is not None:
+        print(f"🚨 MODE KRISIS AKTIF — Model Rebound Buy-the-Dip aktif")
     print(f"{LINE}")
-    print(f"{'Rank':<5} {'Ticker':<7} {'Skor':>6} {'Sinyal':<8} {'RSI':>5} {'Tek':>6} {'Mak':>6} {'Proba':>6} {'Sektor'}")
+    print(f"{'Rank':<5} {'Ticker':<7} {'Skor':>6} {'Sinyal':<8} {'RSI':>5} {'Tek':>6} {'Mak':>6} {'Proba':>6} {'RebProb':>8} {'Sektor'}")
     print(LINE)
     for i, (_, r) in enumerate(top10.iterrows(), 1):
+        rb_str = f"{r.get('proba_rb',0):>8.3f}" if regime == "BEAR" else "       -"
         print(f"{i:<5} {r['ticker']:<7} {r['skor']:>6.1f} {r['sinyal']:<8} "
               f"{r['rsi']:>5.1f} {r['skor_tek']:>6.1f} {r['skor_mak']:>6.1f} "
-              f"{r['proba']:>6.3f} {r['sektor']}")
+              f"{r['proba']:>6.3f} {rb_str} {r['sektor']}")
     print(LINE)
 
     print(f"\nSINYAL:")
@@ -461,24 +514,31 @@ def scoring_improved():
     # Kirim ke Telegram
     if TOKEN and CHAT_ID:
         regime_ikon = "🟢" if regime=="BULL" else "🔴" if regime=="BEAR" else "🟡"
+        mode_krisis = "\n🚨 MODE KRISIS AKTIF — Buy-the-Dip Scanner ON" if (regime=="BEAR" and model_rebound) else ""
         baris = [
             f"IHSG Predictor IMPROVED — {tanggal}",
-            f"Regime: {regime_ikon} {regime} | Threshold: {thr_beli}",
+            f"Regime: {regime_ikon} {regime} | Threshold: {thr_beli}{mode_krisis}",
             "",
             "TOP 10 SAHAM:",
         ]
         for i, (_, r) in enumerate(top10.iterrows(), 1):
             s = "BELI" if r["sinyal"]=="BELI" else "pantau" if r["sinyal"]=="PANTAU" else "skip"
-            baris.append(f"{i:2}. {r['ticker']:5} | {r['skor']:5.1f} | {s}")
+            rb_info = f" | RB:{r.get('proba_rb',0):.2f}" if (regime=="BEAR" and r.get('proba_rb',0)>0.4) else ""
+            baris.append(f"{i:2}. {r['ticker']:5} | {r['skor']:5.1f} | {s}{rb_info}")
 
         if len(beli) > 0:
             baris.append(f"\nSINYAL BELI: {', '.join(beli['ticker'].tolist())}")
         else:
             baris.append(f"\nSemua SKIP/PANTAU — Regime {regime}")
 
-        baris.append(f"\n[Improved: makro real-time + regime detection]")
+        # Kandidat rebound di mode krisis
+        if regime == "BEAR" and len(rebound_candidates) > 0:
+            rb_list = rebound_candidates["ticker"].tolist()
+            baris.append(f"\n🎯 KANDIDAT REBOUND: {', '.join(rb_list)}")
+            baris.append(f"(probabilitas naik ≥2% dalam 5 hari)")
+
+        baris.append(f"\n[Improved: makro real-time + regime detection + rebound scanner]")
         url  = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        pesan = chr(10).join(baris).encode("utf-8")
         data  = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": chr(10).join(baris)}).encode()
         try:
             req = urllib.request.Request(url, data=data)
