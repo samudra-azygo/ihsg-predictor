@@ -127,7 +127,7 @@ def scoring_swing():
 
     # Scan semua saham
     hasil = []
-    folder_list = ["data/idx500", "data", "data/biostatistik/saham"]
+    folder_list = ["data"]
     scanned = set()
 
     for folder in folder_list:
@@ -167,9 +167,9 @@ def scoring_swing():
                 proba = float(model.predict_proba(X_last)[0][1])
 
                 # Sinyal berdasarkan probabilitas
-                if proba >= 0.65:
+                if proba >= 0.55:
                     sinyal = "BELI"
-                elif proba >= 0.52:
+                elif proba >= 0.45:
                     sinyal = "PANTAU"
                 else:
                     sinyal = "SKIP"
@@ -188,7 +188,8 @@ def scoring_swing():
             except:
                 continue
 
-    df_hasil = pd.DataFrame(hasil).sort_values("proba", ascending=False)
+    df_hasil = pd.DataFrame(hasil) if hasil else pd.DataFrame(columns=["ticker","harga","proba","rsi","vol_r","sinyal"])
+    if not df_hasil.empty: df_hasil = df_hasil.sort_values("proba", ascending=False)
     df_hasil.to_csv(f"logs/swing_{tanggal}.csv", index=False)
 
     beli   = df_hasil[df_hasil["sinyal"]=="BELI"]

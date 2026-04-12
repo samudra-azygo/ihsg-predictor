@@ -344,6 +344,14 @@ def jalankan_jadwal():
         print(f"[BRAIN] Tidak aktif: {e}")
 
     print("Jadwal aktif: 08:00 WIB scoring | 22:00 WIB laporan brain")
+    
+    try:
+        from scoring_swing import scoring_swing
+        schedule.every().day.at('21:00').do(scoring_swing)
+        print('[SWING] Jadwal 04:00 WIB aktif')
+    except Exception as e:
+        print(f'[SWING] Error: {e}')
+
     while True:
         schedule.run_pending()
         time.sleep(30)
